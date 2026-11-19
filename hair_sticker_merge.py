@@ -448,6 +448,20 @@ def analyze_sticker(rgba: np.ndarray, alpha_thr: float = 0.4) -> Dict[str, Any]:
     if not has_hole and left[int(cap_y)] >= 0:
         anchor_x = float((left[int(cap_y)] + right[int(cap_y)]) / 2.0)
 
+    # For short/no-hole styles (e.g. men's crops with a sideburn), find where the
+    # central forehead fringe ends so sideburns don't drag the hair over the eyes.
+    mid_x0, mid_x1 = int(0.30 * w), int(0.70 * w)
+    mid_rows = np.flatnonzero(a[:, mid_x0:mid_x1].any(axis=1))
+    front_bottom_y = float(mid_rows[-1]) if mid_rows.size else float(h * 0.65)
+    if not has_hole:
+        # Use upper-cap width (15%..45% of height) so flared sideburns don't skew scale/center
+        upper = width[int(0.15 * h) : max(int(0.16 * h), int(0.45 * h))]
+        if upper.size and upper.max() > 0:
+            cap_width = float(np.percentile(upper[upper > 0], 85)) if (upper > 0).any() else cap_width
+        mid_row = int(np.clip(front_bottom_y * 0.5, 0, h - 1))
+        if left[mid_row] >= 0:
+            anchor_x = float((left[mid_row] + right[mid_row]) / 2.0)
+
     skull_w = float(width[int(hairline_y)]) if has_hole and width[int(hairline_y)] > 0 else cap_width
     band_top = width[: max(1, int(hairline_y))]
     rows_wide = np.flatnonzero(band_top >= 0.62 * skull_w)
@@ -457,6 +471,7 @@ def analyze_sticker(rgba: np.ndarray, alpha_thr: float = 0.4) -> Dict[str, Any]:
         "hairline_y": float(hairline_y),
         "cap_y": cap_y,
         "crown_y": crown_y,
+        "front_bottom_y": front_bottom_y,
         "skull_w": skull_w,
         "anchor_x": anchor_x,
         "cap_width": cap_width,
@@ -502,7 +517,8 @@ def fit_params(
         hi = (hm["width"] * 2.40) / max(1.0, sa["skull_w"])
         scale_x = float(np.clip(scale_x, lo, hi))
     else:
-        scale_x = (hm["width"] * cfg.hair_thickness) / max(1.0, sa["cap_width"])
+        # Short/no-hole hair hugs the temple-to-temple width closely
+        scale_x = (hm["width"] * 1.08) / max(1.0, sa["cap_width"])
 
     # Adapt vertical scale to the user's face height/width aspect ratio (normalized around 1.25)
     user_aspect = hm["height"] / max(1.0, hm["width"])
@@ -511,10 +527,15 @@ def fit_params(
     scale_x *= cfg.scale_adjust
     scale_y *= cfg.scale_adjust
 
-    anchor = (sa["anchor_x"], sa["crown_y"])
-    ty = hm["hairline"][1] - cfg.crown_lift * hm["height"]
-    drop = (sa["hairline_y"] - sa["crown_y"]) * scale_y
-    ty = max(ty, hm["hairline"][1] - drop)
+    if sa["has_hole"]:
+        anchor = (sa["anchor_x"], sa["crown_y"])
+        ty = hm["hairline"][1] - cfg.crown_lift * hm["height"]
+        drop = (sa["hairline_y"] - sa["crown_y"]) * scale_y
+        ty = max(ty, hm["hairline"][1] - drop)
+    else:
+        # Anchor the bottom of the front fringe just above the eyebrows / on the forehead hairline
+        anchor = (sa["anchor_x"], sa["front_bottom_y"])
+        ty = hm["hairline"][1] + 0.04 * hm["height"]
 
     tx = hm["cx"] + hm["width"] * cfg.x_adjust
     if cfg.follow_yaw:
@@ -568,11 +589,18 @@ def face_front_mask(
     pts = (c + (pts - c) * shrink).astype(np.int32)
     m = np.zeros(shape[:2], np.uint8)
     cv2.fillConvexPoly(m, cv2.convexHull(pts), 255)
+    out = m.astype(np.float32) / 255.0
     if cut_y is not None:
-        m[: max(0, int(cut_y)), :] = 0
+        cy = int(cut_y)
+        ramp = max(12, int(shape[0] * 0.025))
+        y0 = max(0, cy - ramp)
+        out[:y0, :] = 0.0
+        if cy > y0:
+            grad = np.linspace(0.0, 1.0, cy - y0, dtype=np.float32)[:, None]
+            out[y0:cy, :] *= grad
     if feather > 0:
-        m = cv2.GaussianBlur(m, (0, 0), feather)
-    return m.astype(np.float32) / 255.0
+        out = cv2.GaussianBlur(out, (0, 0), feather)
+    return out
 
 
 def head_box(
