@@ -494,42 +494,52 @@ def fit_params(
     hm: Dict[str, Any],
     sa: Dict[str, Any],
     cfg: MergeConfig,
-) -> Tuple[float, Tuple[float, float], Tuple[float, float]]:
-    """Compute `(scale, anchor_in_sticker, target_in_photo)`."""
+) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+    """Compute `((scale_x, scale_y), anchor_in_sticker, target_in_photo)` from user head geometry."""
     if sa["has_hole"] and sa["hole_width"] > 0.25 * sa["cap_width"]:
-        scale = (hm["width"] * cfg.face_fill) / max(1.0, sa["hole_width"])
+        scale_x = (hm["width"] * cfg.face_fill) / max(1.0, sa["hole_width"])
         lo = (hm["width"] * 1.05) / max(1.0, sa["skull_w"])
         hi = (hm["width"] * 2.40) / max(1.0, sa["skull_w"])
-        scale = float(np.clip(scale, lo, hi))
+        scale_x = float(np.clip(scale_x, lo, hi))
     else:
-        scale = (hm["width"] * cfg.hair_thickness) / max(1.0, sa["cap_width"])
-    scale *= cfg.scale_adjust
+        scale_x = (hm["width"] * cfg.hair_thickness) / max(1.0, sa["cap_width"])
+
+    # Adapt vertical scale to the user's face height/width aspect ratio (normalized around 1.25)
+    user_aspect = hm["height"] / max(1.0, hm["width"])
+    scale_y = scale_x * float(np.clip(user_aspect / 1.25, 0.85, 1.20))
+
+    scale_x *= cfg.scale_adjust
+    scale_y *= cfg.scale_adjust
 
     anchor = (sa["anchor_x"], sa["crown_y"])
     ty = hm["hairline"][1] - cfg.crown_lift * hm["height"]
-    drop = (sa["hairline_y"] - sa["crown_y"]) * scale
+    drop = (sa["hairline_y"] - sa["crown_y"]) * scale_y
     ty = max(ty, hm["hairline"][1] - drop)
 
     tx = hm["cx"] + hm["width"] * cfg.x_adjust
     if cfg.follow_yaw:
         tx += hm["yaw"] * hm["width"] * 0.12
-    return float(scale), anchor, (float(tx), float(ty + hm["height"] * cfg.y_adjust))
+    return (float(scale_x), float(scale_y)), anchor, (float(tx), float(ty + hm["height"] * cfg.y_adjust))
 
 
 def place_rgba(
     rgba: np.ndarray,
     anchor: Tuple[float, float],
     target: Tuple[float, float],
-    scale: float,
+    scale: Union[float, Tuple[float, float]],
     angle_deg: float,
     out_hw: Tuple[int, int],
 ) -> np.ndarray:
     """Warp BGRA sticker onto the target canvas around `anchor -> target`."""
+    sx, sy = scale if isinstance(scale, tuple) else (scale, scale)
     r = np.deg2rad(angle_deg)
-    c, s = np.cos(r) * scale, np.sin(r) * scale
+    c, s = np.cos(r), np.sin(r)
     ax, ay = anchor
     tx, ty = target
-    m = np.float32([[c, s, tx - (c * ax + s * ay)], [-s, c, ty - (-s * ax + c * ay)]])
+    m = np.float32([
+        [c * sx, s * sy, tx - (c * sx * ax + s * sy * ay)],
+        [-s * sx, c * sy, ty - (-s * sx * ax + c * sy * ay)],
+    ])
     return cv2.warpAffine(
         rgba,
         m,
@@ -680,8 +690,10 @@ def smart_merge(
         st = match_lighting(st, user_bgr, box, strength=cfg.tone)
 
     sa = analyze_sticker(st)
-    scale, anchor, target = fit_params(hm, sa, cfg)
-    warped = place_rgba(st, anchor, target, scale, hm["angle"] + cfg.extra_rot, user_bgr.shape[:2])
+    (scale_x, scale_y), anchor, target = fit_params(hm, sa, cfg)
+    warped = place_rgba(
+        st, anchor, target, (scale_x, scale_y), hm["angle"] + cfg.extra_rot, user_bgr.shape[:2]
+    )
     cover = warped[:, :, 3].astype(np.float32) / 255.0
 
     base = user_bgr
@@ -705,11 +717,13 @@ def smart_merge(
 
     info.update(
         head_width=round(hm["width"]),
+        head_height=round(hm["height"]),
         roll=round(hm["angle"], 1),
         yaw=round(hm["yaw"], 2),
-        scale=round(scale, 3),
-        opening_px=round(sa["hole_width"] * scale),
-        outer_px=round(sa["cap_width"] * scale),
+        scale_x=round(scale_x, 3),
+        scale_y=round(scale_y, 3),
+        opening_px=round(sa["hole_width"] * scale_x),
+        outer_px=round(sa["cap_width"] * scale_x),
         found_opening=sa["has_hole"],
         covered_px=int((cover > 0.5).sum()),
     )
