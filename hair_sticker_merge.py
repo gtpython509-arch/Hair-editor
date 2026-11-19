@@ -13,12 +13,14 @@ CLI usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import logging
 import os
 import urllib.request
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -751,14 +753,172 @@ def merge_files(
     return info
 
 
+# ------------------------------------------------------------------ Localhost Test UI
+
+_HTML_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Hair Sticker Merge — Local Test UI</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
+    .card { background: #1f2937; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: #d1d5db; }
+    input, button { padding: 8px 10px; border-radius: 6px; border: 1px solid #374151; background: #111827; color: #f9fafb; }
+    button { background: #2563eb; border-color: #2563eb; cursor: pointer; font-weight: 600; padding: 10px 18px; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    img { width: 100%; border-radius: 8px; background: #030712; }
+    pre { background: #030712; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Hair Sticker Merge — Localhost Test UI</h2>
+  <div class="card">
+    <div class="row">
+      <label>User Photo <input id="userFile" type="file" accept="image/*" /></label>
+      <label>Hair Sticker <input id="hairFile" type="file" accept="image/*" /></label>
+      <label>Tint Hex (optional) <input id="tint" type="text" placeholder="#1E3FCF" style="width:110px" /></label>
+      <label>Tone (0-1) <input id="tone" type="number" min="0" max="1" step="0.1" value="0" style="width:80px" /></label>
+      <label>Scale <input id="scale" type="number" min="0.5" max="2" step="0.05" value="1" style="width:80px" /></label>
+      <label style="flex-direction:row;align-items:center"><input id="removeHair" type="checkbox" checked /> Remove Hair</label>
+      <label style="flex-direction:row;align-items:center"><input id="protectFace" type="checkbox" checked /> Protect Face</label>
+      <button id="runBtn">Merge Hair</button>
+    </div>
+    <p id="status" style="margin:10px 0 0;font-size:13px;color:#9ca3af"></p>
+  </div>
+  <div class="grid">
+    <div class="card"><h4>Result</h4><img id="resImg" /></div>
+    <div class="card"><h4>Debug Geometry</h4><img id="dbgImg" /></div>
+  </div>
+  <div class="card"><h4>Metrics</h4><pre id="metrics">{}</pre></div>
+  <script>
+    const toB64 = f => new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result.split(',')[1]);
+      r.onerror = rej;
+      r.readAsDataURL(f);
+    });
+    document.getElementById('runBtn').onclick = async () => {
+      const uf = document.getElementById('userFile').files[0];
+      const hf = document.getElementById('hairFile').files[0];
+      const st = document.getElementById('status');
+      if (!uf || !hf) { st.textContent = 'Select both User Photo and Hair Sticker.'; return; }
+      const btn = document.getElementById('runBtn');
+      btn.disabled = true; st.textContent = 'Processing...';
+      try {
+        const payload = {
+          user_b64: await toB64(uf),
+          hair_b64: await toB64(hf),
+          tint: document.getElementById('tint').value.trim() || null,
+          tone: parseFloat(document.getElementById('tone').value) || 0,
+          scale_adjust: parseFloat(document.getElementById('scale').value) || 1,
+          remove_hair: document.getElementById('removeHair').checked,
+          protect_face: document.getElementById('protectFace').checked,
+        };
+        const resp = await fetch('/merge', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Merge failed');
+        document.getElementById('resImg').src = 'data:image/png;base64,' + data.result_b64;
+        document.getElementById('dbgImg').src = 'data:image/png;base64,' + data.debug_b64;
+        document.getElementById('metrics').textContent = JSON.stringify(data.info, null, 2);
+        st.textContent = 'Done.';
+      } catch (e) {
+        st.textContent = 'Error: ' + e.message;
+      } finally { btn.disabled = false; }
+    };
+  </script>
+</body>
+</html>
+"""
+
+
+def serve_ui(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    model_dir: Optional[Union[str, Path]] = None,
+) -> None:
+    """Start a lightweight localhost HTTP UI for testing `smart_merge`."""
+    bundle = get_models(model_dir=model_dir)
+    bundle.ensure_models()
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send_json(self, code: int, obj: Dict[str, Any]) -> None:
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:  # noqa: N802
+            body = _HTML_PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/merge":
+                self._send_json(404, {"error": "Not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                user_bgr = load_image(base64.b64decode(req["user_b64"]))
+                style_rgba = load_sticker(base64.b64decode(req["hair_b64"]))
+                cfg = MergeConfig(
+                    remove_hair=bool(req.get("remove_hair", True)),
+                    protect_face=bool(req.get("protect_face", True)),
+                    scale_adjust=float(req.get("scale_adjust", 1.0)),
+                    tint=req.get("tint") or None,
+                    tone=float(req.get("tone", 0.0)),
+                    debug=True,
+                )
+                result_bgr, info = smart_merge(user_bgr, style_rgba, config=cfg, models=bundle)
+                if "error" in info:
+                    self._send_json(400, {"error": info["error"]})
+                    return
+                dbg = info.pop("debug", result_bgr)
+                _, res_png = cv2.imencode(".png", result_bgr)
+                _, dbg_png = cv2.imencode(".png", dbg)
+                self._send_json(
+                    200,
+                    {
+                        "result_b64": base64.b64encode(res_png.tobytes()).decode("ascii"),
+                        "debug_b64": base64.b64encode(dbg_png.tobytes()).decode("ascii"),
+                        "info": info,
+                    },
+                )
+            except Exception as exc:
+                logger.exception("Merge request failed")
+                self._send_json(500, {"error": str(exc)})
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Hair Sticker Merge UI running at http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+
+
 # ------------------------------------------------------------------ CLI
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Auto-fit and merge a hair sticker onto a portrait photo.")
-    ap.add_argument("--user", required=True, help="Path to user portrait photo")
-    ap.add_argument("--hair", required=True, help="Path to hair sticker PNG/image")
+    ap.add_argument("--user", help="Path to user portrait photo")
+    ap.add_argument("--hair", help="Path to hair sticker PNG/image")
     ap.add_argument("--out", default="result.png", help="Output image path")
+    ap.add_argument("--serve", action="store_true", help="Launch localhost web UI for testing")
+    ap.add_argument("--host", default="127.0.0.1", help="Host for --serve (default: 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8000, help="Port for --serve (default: 8000)")
     ap.add_argument("--debug-out", default=None, help="Optional path to save debug overlay")
     ap.add_argument("--model-dir", default=None, help="Directory for MediaPipe model files")
     ap.add_argument("--tint", default=None, help="Optional hex tint colour, e.g. '#1E3FCF'")
@@ -780,6 +940,9 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    if args.serve or not (args.user and args.hair):
+        serve_ui(host=args.host, port=args.port, model_dir=args.model_dir)
+        return 0
     cfg = MergeConfig(
         remove_hair=not args.no_remove_hair,
         protect_face=not args.no_protect_face,
